@@ -1,0 +1,7 @@
+streamlit>=1.36
+pandas>=2.2
+python-dotenv>=1.0
+httpx>=0.27
+anthropic>=0.40
+snaptrade-python-sdk>=11.0
+pydantic>=2.7
