@@ -132,10 +132,13 @@ def get_scorecards(
     _targets: dict[str, AnalystTarget],
     _news: list[NewsItem],
     _sentiments: dict[str, SentimentReading],
+    _holdings: list[Holding],
 ) -> tuple[list[Scorecard], datetime]:
     data = _safe(
         "Claude synthesis",
-        lambda: build_scorecards(list(symbols), _quotes, _targets, _news, _sentiments),
+        lambda: build_scorecards(
+            list(symbols), _quotes, _targets, _news, _sentiments, _holdings,
+        ),
         [],
     )
     return data, clock.now_et()
@@ -170,7 +173,10 @@ def mock_quotes() -> dict[str, Quote]:
 # ---------- UI ----------
 
 RATING_EMOJI = {"Bullish": "🟢", "Hold": "🟡", "Bearish": "🔴", "—": "⚪"}
-ACTION_EMOJI = {"Add": "➕", "Trim": "➖", "Initiate": "🆕", "Hold": "✓"}
+ACTION_EMOJI = {
+    "Add": "➕", "Trim": "➖", "Initiate": "🆕", "Hold": "✓",
+    "Exit": "🚪", "Watch": "👀",
+}
 
 
 def status_banner() -> None:
@@ -316,8 +322,22 @@ def render_briefing(
     st.markdown(briefing.markdown)
 
 
+def _fmt_action_size(rec) -> str:
+    """E.g., '$5,200 (+24 sh)' or '—' when no trade."""
+    if rec.action in ("Hold", "Watch"):
+        return ""
+    if rec.dollars == 0:
+        return ""
+    sign = "+" if rec.dollars > 0 else "-"
+    dollars = abs(rec.dollars)
+    parts = [f"{sign}{_esc(f'${dollars:,.0f}')}"]
+    if rec.shares:
+        parts.append(f"({rec.shares:+.1f} sh)")
+    return " ".join(parts)
+
+
 def render_scorecard_mobile(cards: list[Scorecard], fetched: datetime, nxt: datetime) -> None:
-    """Mobile-first verdict view: compact summary + one expander per ticker."""
+    """Mobile-first verdict view: action recommendation + verdict per ticker."""
     st.subheader("Verdict Scorecard")
     render_freshness_caption("Verdicts", fetched, nxt)
 
@@ -325,51 +345,76 @@ def render_scorecard_mobile(cards: list[Scorecard], fetched: datetime, nxt: date
         st.info("Scorecard unavailable.")
         return
 
-    n_bull = sum(1 for c in cards if c.rating == "Bullish")
-    n_bear = sum(1 for c in cards if c.rating == "Bearish")
-    n_hold = sum(1 for c in cards if c.rating == "Hold")
-    high_conf_bull = [c for c in cards if c.rating == "Bullish" and (c.confidence or 0) >= 0.7]
-    high_conf_bear = [c for c in cards if c.rating == "Bearish" and (c.confidence or 0) >= 0.7]
+    # Action counts (more useful than verdict-only counts since these are
+    # what the user actually does).
+    action_counts: dict[str, int] = {}
+    for c in cards:
+        action_counts[c.recommendation.action] = action_counts.get(c.recommendation.action, 0) + 1
 
-    st.markdown(
-        f"🟢 **{n_bull}** Bullish · 🟡 **{n_hold}** Hold · 🔴 **{n_bear}** Bearish"
-    )
-    if high_conf_bull:
-        st.markdown(
-            "**High-confidence Bull (≥70%):** "
-            + ", ".join(c.symbol for c in high_conf_bull)
-        )
+    summary_bits = []
+    for act in ("Initiate", "Add", "Trim", "Exit", "Hold", "Watch"):
+        n = action_counts.get(act, 0)
+        if n:
+            summary_bits.append(f"{ACTION_EMOJI.get(act, '·')} **{n}** {act}")
+    st.markdown(" · ".join(summary_bits))
+
+    high_conf_bear = [
+        c for c in cards
+        if c.rating == "Bearish" and (c.confidence or 0) >= 0.7
+    ]
     if high_conf_bear:
         st.warning(
             "High-confidence Bearish: "
             + ", ".join(c.symbol for c in high_conf_bear)
         )
     st.caption(
-        "Claude fuses fundamentals + Polygon news + Grok X-sentiment into a per-ticker rating."
+        "Action combines Claude's Bullish/Hold/Bearish verdict with your "
+        "current portfolio weight vs target. Sorted by urgency."
     )
 
     for c in cards:
-        emoji = RATING_EMOJI.get(c.rating, "⚪")
+        v_emoji = RATING_EMOJI.get(c.rating, "⚪")
+        a_emoji = ACTION_EMOJI.get(c.recommendation.action, "·")
         conf_str = f" {c.confidence:.0%}" if c.confidence is not None else ""
-        delta_str = f"Δ {c.change_pct:+.1f}%" if c.change_pct is not None else "Δ —"
+        action_size = _fmt_action_size(c.recommendation)
+        action_label = (
+            f"{a_emoji} {c.recommendation.action} {action_size}".strip()
+            if action_size else f"{a_emoji} {c.recommendation.action}"
+        )
         title = (
-            f"{emoji} {c.symbol} · {c.rating}{conf_str} · {delta_str} · {c.role}"
+            f"{v_emoji} {c.symbol} → {action_label} · "
+            f"{c.rating}{conf_str} · {c.role}"
         )
         with st.expander(title, expanded=False):
-            # Inline metric line — readable on phone, no st.columns.
+            # Recommendation block first — what to do.
+            st.markdown(
+                f"**Action: {a_emoji} {c.recommendation.action}"
+                + (f" {action_size}" if action_size else "")
+                + "**  \n"
+                + c.recommendation.rationale
+            )
+            st.caption(
+                f"Current weight {c.current_weight:.1%} · "
+                f"Target {c.target_weight:.1%} · "
+                f"Held value {_esc(f'${c.current_value:,.0f}')}"
+            )
+
+            # Inline metric line.
             price_str = f"${c.price:,.2f}" if c.price is not None else "—"
             up_str = (
                 f"{c.analyst_upside_pct:+.1f}%"
                 if c.analyst_upside_pct is not None else "—"
             )
+            delta_str = f"{c.change_pct:+.2f}%" if c.change_pct is not None else "—"
             cat_str = f"{c.catalyst_score:+d}" if c.catalyst_score is not None else "—"
             sent_str = (
                 f"{c.sentiment_score:+.2f}"
                 if c.sentiment_score is not None else "—"
             )
             st.markdown(
-                f"**Price** {_esc(price_str)} · **Upside** {up_str} · "
-                f"**Catalyst** {cat_str} · **X-Sent** {sent_str}"
+                f"**Price** {_esc(price_str)} · **Δ** {delta_str} · "
+                f"**Upside** {up_str} · **Catalyst** {cat_str} · "
+                f"**X-Sent** {sent_str}"
             )
 
             if c.thesis:
@@ -466,10 +511,15 @@ def _warm_caches() -> dict:
     news_b = clock.news_bucket()
     verdict_b = f"{daily_b}|{news_b}"
 
+    owner = auth.is_owner()
+
     with st.status("📡 Loading data…", expanded=True) as s:
-        s.write("📊 Holdings (SnapTrade)…")
-        holdings, _ = get_holdings(holdings_b)
-        s.write(f"   → {len(holdings)} positions" if holdings else "   → using mock holdings")
+        if owner:
+            s.write("📊 Holdings (SnapTrade)…")
+            holdings, _ = get_holdings(holdings_b)
+            s.write(f"   → {len(holdings)} positions" if holdings else "   → using mock holdings")
+        else:
+            s.write("📊 Holdings — skipped (guest mode)")
 
         s.write("💹 Quotes & analyst targets (FMP)…")
         quotes, _ = get_quotes(tuple(TICKERS), daily_b)
@@ -494,17 +544,24 @@ def _warm_caches() -> dict:
         )
 
         if llm.is_configured():
-            quotes_for_cards, _ = get_quotes(tuple(TICKERS), daily_b)
-            targets_for_cards, _ = get_targets(tuple(TICKERS), daily_b)
-            if not quotes_for_cards:
-                quotes_for_cards = mock_quotes()
+            if owner:
+                quotes_for_cards, _ = get_quotes(tuple(TICKERS), daily_b)
+                targets_for_cards, _ = get_targets(tuple(TICKERS), daily_b)
+                holdings_for_cards, _ = get_holdings(holdings_b)
+                if not quotes_for_cards:
+                    quotes_for_cards = mock_quotes()
+                if not holdings_for_cards:
+                    holdings_for_cards = mock_holdings()
 
-            s.write("🤖 Per-ticker verdicts (Claude, parallel)…")
-            cards, _ = get_scorecards(
-                tuple(TICKERS), verdict_b,
-                quotes_for_cards, targets_for_cards, news, sentiments,
-            )
-            s.write(f"   → {len(cards)} verdicts synthesized")
+                s.write("🤖 Per-ticker verdicts + recommended actions (Claude, parallel)…")
+                cards, _ = get_scorecards(
+                    tuple(TICKERS), verdict_b,
+                    quotes_for_cards, targets_for_cards, news, sentiments,
+                    holdings_for_cards,
+                )
+                s.write(f"   → {len(cards)} verdicts synthesized")
+            else:
+                s.write("🤖 Verdicts — skipped (guest mode)")
 
             s.write("📅 Pre-market + post-market briefings (Claude, parallel)…")
             with ThreadPoolExecutor(max_workers=2) as ex:
@@ -553,7 +610,7 @@ def render_dashboard() -> None:
         news, _ = get_news(tuple(TICKERS), news_b)
         sentiments, _ = get_sentiment(tuple(TICKERS), daily_b)
         cards, cards_at = get_scorecards(
-            tuple(TICKERS), verdict_b, quotes, targets, news, sentiments,
+            tuple(TICKERS), verdict_b, quotes, targets, news, sentiments, holdings,
         )
         if cards:
             render_scorecard_mobile(cards, cards_at, verdict_next)
@@ -573,23 +630,31 @@ def main() -> None:
 
     # ---- Sidebar ----
     with st.sidebar:
-        st.header("Refresh")
-        if st.button("🔄 Refresh all on demand", use_container_width=True, type="primary"):
-            st.cache_data.clear()
-            st.rerun()
-        st.caption("Forces a full refetch of every source.")
+        role_badge = "👤 Owner" if auth.is_owner() else "👋 Guest"
+        st.markdown(f"**Signed in:** {role_badge}")
         st.divider()
+        if auth.is_owner():
+            st.header("Refresh")
+            if st.button("🔄 Refresh all on demand", use_container_width=True, type="primary"):
+                st.cache_data.clear()
+                st.rerun()
+            st.caption("Forces a full refetch of every source.")
+            st.divider()
         st.markdown(f"**Now:** {clock.fmt_dt(clock.now_et())}")
         st.markdown("**Schedule (PT):**")
-        st.markdown(
-            "- Holdings: 15:00 daily\n"
-            "- FMP / Grok: 06:15 weekdays\n"
-            "- News: 06:15 + every 15 min in-session\n"
-            "- Pre-market brief: 06:15 weekdays\n"
-            "- Post-market brief: 14:00 weekdays\n"
-            "- X Hot Chatter: every 15 min (06:15–14:00 weekdays)\n"
-            f"- @{FLOWGOD_HANDLE} flow: every 10 min (06:15–14:00 weekdays)"
-        )
+        schedule_items = [
+            "- Pre-market brief: 06:15 weekdays",
+            "- Post-market brief: 14:00 weekdays",
+            "- X Hot Chatter: every 15 min (06:15–14:00 weekdays)",
+            f"- @{FLOWGOD_HANDLE} flow: every 10 min (06:15–14:00 weekdays)",
+        ]
+        if auth.is_owner():
+            schedule_items[:0] = [
+                "- Holdings: 15:00 daily",
+                "- FMP / Grok: 06:15 weekdays",
+                "- News: 06:15 + every 15 min in-session",
+            ]
+        st.markdown("\n".join(schedule_items))
 
     # ---- Warm all caches with visible progress ----
     _warm_caches()
@@ -606,13 +671,18 @@ def main() -> None:
     hot, hot_at = get_hot_chatter(chatter_b)
     flows, flows_at = get_flowgod(flowgod_b)
 
-    tab_dash, tab_pre, tab_post, tab_chat, tab_flow = st.tabs(
-        ["📊 Dashboard", "🌅 Pre-Market", "🌇 Post-Market",
-         "🔥 X Chatter", "🌊 FlowGod"]
-    )
-
-    with tab_dash:
-        render_dashboard()
+    if auth.is_owner():
+        tab_dash, tab_pre, tab_post, tab_chat, tab_flow = st.tabs(
+            ["📊 Dashboard", "🌅 Pre-Market", "🌇 Post-Market",
+             "🔥 X Chatter", "🌊 FlowGod"]
+        )
+        with tab_dash:
+            render_dashboard()
+    else:
+        tab_pre, tab_post, tab_chat, tab_flow = st.tabs(
+            ["🌅 Pre-Market", "🌇 Post-Market",
+             "🔥 X Chatter", "🌊 FlowGod"]
+        )
 
     with tab_pre:
         briefing, briefing_at = get_pre_briefing(pre_b, hot)

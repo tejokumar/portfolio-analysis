@@ -16,7 +16,7 @@ _SECRET_KEYS = (
     "SNAPTRADE_USER_ID", "SNAPTRADE_USER_SECRET",
     "FMP_API_KEY", "POLYGON_API_KEY",
     "GROK_API_KEY", "ANTHROPIC_API_KEY",
-    "APP_PASSWORD",
+    "APP_PASSWORD", "OWNER_PASSWORD",
 )
 try:
     import streamlit as _st  # type: ignore
