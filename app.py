@@ -346,34 +346,33 @@ def render_analyze(
         st.error(f"Analysis failed for {sym}. Check the error panel below.")
         return
 
-    # Header strip with key numbers.
-    cols = st.columns(4)
-    cols[0].metric(
-        "Price",
-        f"${analysis.quote.price:,.2f}" if analysis.quote else "—",
-        delta=(
-            f"{analysis.quote.change_pct:+.2f}%"
-            if analysis.quote and analysis.quote.change_pct is not None else None
-        ),
+    # Compact header — single markdown line works on mobile and desktop.
+    price_str = (
+        f"{_esc(f'${analysis.quote.price:,.2f}')}"
+        if analysis.quote else "—"
     )
-    cols[1].metric(
-        "Analyst Upside",
-        f"{analysis.analyst_upside_pct:+.1f}%" if analysis.analyst_upside_pct is not None else "—",
-        help=(
-            f"Consensus ${analysis.target.target_consensus}"
-            if analysis.target and analysis.target.target_consensus else None
-        ),
+    delta_str = (
+        f"{analysis.quote.change_pct:+.2f}%"
+        if analysis.quote and analysis.quote.change_pct is not None else "—"
     )
-    cols[2].metric(
-        "Sentiment (X)",
-        f"{analysis.sentiment.score:+.2f}" if analysis.sentiment else "—",
+    upside_str = (
+        f"{analysis.analyst_upside_pct:+.1f}%"
+        if analysis.analyst_upside_pct is not None else "—"
     )
-    cols[3].metric(
-        "FlowGod hits",
-        f"{len(analysis.flow_posts)}",
-        help="Posts captured today mentioning this ticker",
+    sent_str = (
+        f"{analysis.sentiment.score:+.2f}"
+        if analysis.sentiment else "—"
+    )
+    consensus_note = (
+        f" (consensus {_esc(f'${analysis.target.target_consensus}')})"
+        if analysis.target and analysis.target.target_consensus else ""
     )
 
+    st.markdown(
+        f"**{analysis.symbol}** · Price {price_str} **{delta_str}** · "
+        f"Upside {upside_str}{consensus_note} · "
+        f"X-Sent {sent_str} · FlowGod hits **{len(analysis.flow_posts)}**"
+    )
     st.caption(
         f"Fetched {clock.fmt_dt(fetched_at)} · "
         f"{len(analysis.news)} news · {len(analysis.hot_mentions)} chatter mentions"
