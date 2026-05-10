@@ -21,13 +21,14 @@ _SECRET_KEYS = (
 try:
     import streamlit as _st  # type: ignore
     for _k in _SECRET_KEYS:
+        v = None
         try:
             v = _st.secrets.get(_k)
-        except (FileNotFoundError, KeyError):
-            v = None
+        except Exception:  # noqa: BLE001 — secrets.toml may be missing or malformed
+            pass
         if v and not os.getenv(_k):
             os.environ[_k] = str(v)
-except ImportError:
+except Exception:  # noqa: BLE001 — streamlit may not import yet at config-import time
     pass
 
 PORTFOLIO_VALUE = 500_000.0
