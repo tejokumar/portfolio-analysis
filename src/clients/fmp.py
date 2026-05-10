@@ -52,6 +52,35 @@ class EarningsEvent:
     time: str | None  # "bmo" | "amc" | None
 
 
+@dataclass
+class CompanyProfile:
+    symbol: str
+    name: str | None
+    sector: str | None
+    industry: str | None
+    market_cap: float | None
+    beta: float | None
+    description: str | None
+    website: str | None
+    ceo: str | None
+    country: str | None
+
+
+@dataclass
+class Ratios:
+    symbol: str
+    pe: float | None
+    price_to_sales: float | None
+    price_to_book: float | None
+    ev_to_ebitda: float | None
+    debt_to_equity: float | None
+    gross_margin: float | None
+    operating_margin: float | None
+    net_margin: float | None
+    dividend_yield: float | None
+    current_ratio: float | None
+
+
 def is_configured() -> bool:
     return bool(SETTINGS.fmp_api_key)
 
@@ -168,6 +197,69 @@ def fetch_earnings_calendar(from_date: str, to_date: str) -> list[EarningsEvent]
         )
     out.sort(key=lambda e: (e.date, e.symbol))
     return out
+
+
+def fetch_profile(symbol: str) -> CompanyProfile | None:
+    """Company description, sector, market cap, beta, etc."""
+    if not is_configured() or not symbol:
+        return None
+    try:
+        with _client() as c:
+            r = c.get(
+                f"{STABLE_URL}/profile",
+                params={"symbol": symbol, "apikey": SETTINGS.fmp_api_key},
+            )
+            r.raise_for_status()
+            rows = r.json() or []
+    except httpx.HTTPError:
+        return None
+    if not rows:
+        return None
+    row = rows[0]
+    return CompanyProfile(
+        symbol=row.get("symbol", symbol),
+        name=row.get("companyName"),
+        sector=row.get("sector"),
+        industry=row.get("industry"),
+        market_cap=row.get("mktCap") or row.get("marketCap"),
+        beta=row.get("beta"),
+        description=row.get("description"),
+        website=row.get("website"),
+        ceo=row.get("ceo"),
+        country=row.get("country"),
+    )
+
+
+def fetch_ratios_ttm(symbol: str) -> Ratios | None:
+    """Trailing-twelve-month valuation/profitability ratios."""
+    if not is_configured() or not symbol:
+        return None
+    try:
+        with _client() as c:
+            r = c.get(
+                f"{STABLE_URL}/ratios-ttm",
+                params={"symbol": symbol, "apikey": SETTINGS.fmp_api_key},
+            )
+            r.raise_for_status()
+            rows = r.json() or []
+    except httpx.HTTPError:
+        return None
+    if not rows:
+        return None
+    row = rows[0]
+    return Ratios(
+        symbol=symbol,
+        pe=row.get("priceToEarningsRatioTTM"),
+        price_to_sales=row.get("priceToSalesRatioTTM"),
+        price_to_book=row.get("priceToBookRatioTTM"),
+        ev_to_ebitda=row.get("enterpriseValueMultipleTTM"),
+        debt_to_equity=row.get("debtToEquityRatioTTM"),
+        gross_margin=row.get("grossProfitMarginTTM"),
+        operating_margin=row.get("operatingProfitMarginTTM"),
+        net_margin=row.get("netProfitMarginTTM"),
+        dividend_yield=row.get("dividendYieldTTM"),
+        current_ratio=row.get("currentRatioTTM"),
+    )
 
 
 def fetch_analyst_targets(symbols: list[str]) -> dict[str, AnalystTarget]:

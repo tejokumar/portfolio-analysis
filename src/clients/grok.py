@@ -85,10 +85,13 @@ class FlowPost:
     url: str | None
 
 
-def fetch_hot_chatter(focus: str = "AI, semiconductors, mega-cap tech") -> list[HotTicker]:
+def fetch_hot_chatter() -> list[HotTicker]:
     """Single Grok x_search returning top US tickers being discussed on X.
 
-    Restricts to verified financial accounts; excludes meme/retail noise.
+    Theme-aware and sector-agnostic — Grok identifies the dominant rotations
+    of the week (could be AI, energy, defense, biotech, anything) and returns
+    the leading bullish/bearish names within those themes. Restricts to verified
+    financial accounts; excludes meme/retail noise.
     """
     if not is_configured():
         return []
@@ -96,11 +99,17 @@ def fetch_hot_chatter(focus: str = "AI, semiconductors, mega-cap tech") -> list[
     system = (
         "You are a buy-side analyst scanning X for the most-discussed individual "
         "US stocks and ETFs in the last 12-24 hours. Use the x_search tool. "
+        "First identify the dominant 2-3 sector/rotation themes capital is "
+        "flowing into RIGHT NOW (let the chatter decide — could be AI, energy, "
+        "defense, healthcare, biotech, financials, materials, consumer, etc.). "
+        "Then return the leading bullish/bearish tickers within those themes. "
         "Restrict to verified financial accounts (named analysts, fund managers, "
         "industry insiders, financial journalists). Discount memes and anonymous "
-        "retail. Output JSON only, no prose: "
+        "retail. Aim for 6-10 entries spanning at least 2 different themes when "
+        "the chatter supports it.\n\n"
+        "Output JSON only, no prose: "
         '{"hot": [{"ticker": "<TICKER>", "side": "Bullish"|"Bearish"|"Mixed", '
-        '"thesis": "<one sentence>"}, ...]}. Aim for 6-10 entries.'
+        '"thesis": "<one sentence including which theme it fits>"}, ...]}.'
     )
     body = {
         "model": MODEL,
@@ -108,7 +117,10 @@ def fetch_hot_chatter(focus: str = "AI, semiconductors, mega-cap tech") -> list[
             {"role": "system", "content": system},
             {
                 "role": "user",
-                "content": f"Hot tickers right now, focus on: {focus}.",
+                "content": (
+                    "What are the hottest individual US tickers on X right now, "
+                    "and what themes are they part of?"
+                ),
             },
         ],
         "tools": [{"type": "x_search"}],

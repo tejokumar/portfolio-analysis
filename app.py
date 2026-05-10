@@ -19,6 +19,7 @@ from datetime import datetime
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
 
 from src import auth, clock
@@ -28,6 +29,7 @@ from src.clients.grok import FLOWGOD_HANDLE, FlowPost, HotTicker, SentimentReadi
 from src.clients.polygon import NewsItem
 from src.clients.snaptrade import Holding
 from src.config import PORTFOLIO_VALUE, TARGET_ALLOCATION, TICKERS
+from src.modules.analyze import TickerAnalysis, analyze, normalize_ticker
 from src.modules.briefing import Briefing, generate_briefing
 from src.modules.rebalancer import build_rebalance_table
 from src.modules.scorecard import Scorecard, build_scorecards
@@ -105,6 +107,23 @@ def get_hot_chatter(bucket: str) -> tuple[list[HotTicker], datetime]:
 @st.cache_data(ttl=86_400, show_spinner=False, max_entries=256)
 def get_flowgod(bucket: str) -> tuple[list[FlowPost], datetime]:
     data = _safe(f"@{FLOWGOD_HANDLE} flow", grok.fetch_flowgod_flow, [])
+    return data, clock.now_et()
+
+
+@st.cache_data(ttl=3_600, show_spinner=False, max_entries=200)
+def get_analysis(
+    symbol: str,
+    nonce: int,
+    _hot: list[HotTicker],
+    _flows: list[FlowPost],
+) -> tuple[TickerAnalysis | None, datetime]:
+    """Per-ticker analysis cached for 1 hour. `nonce` is incremented per ticker
+    by the manual refresh button, forcing a cache miss + refetch."""
+    data = _safe(
+        f"Analyze ${symbol}",
+        lambda: analyze(symbol, cached_hot=_hot, cached_flows=_flows),
+        None,
+    )
     return data, clock.now_et()
 
 
@@ -248,6 +267,160 @@ def render_chatter(
     _block("Bullish chatter", bullish)
     _block("Bearish chatter", bearish)
     _block("Mixed chatter", mixed)
+
+
+def render_analyze(
+    hot: list[HotTicker],
+    flows: list[FlowPost],
+) -> None:
+    st.subheader("🔍 Analyze a Ticker")
+    st.caption(
+        "Enter any US ticker. The bot pulls FMP quote / target / profile / "
+        "ratios, Polygon news, Grok X-sentiment, and any FlowGod or X-chatter "
+        "mentions today, then has Claude synthesize a Bullish / Hold / Bearish "
+        "thesis with bull/bear cases, valuation read, and bottom-line action. "
+        "Each ticker is cached for 1 hour."
+    )
+
+    # Visual uppercase + iOS-keyboard autocapitalize for the analyze input.
+    # Scoped to inputs that carry our placeholder so the password field is untouched.
+    components.html(
+        """
+        <script>
+        const root = window.parent.document;
+        const apply = () => {
+            root.querySelectorAll('input[placeholder*="NVDA"]').forEach(el => {
+                el.setAttribute('autocapitalize', 'characters');
+                el.setAttribute('autocorrect', 'off');
+                el.setAttribute('spellcheck', 'false');
+                el.style.textTransform = 'uppercase';
+            });
+        };
+        apply();
+        // Streamlit may re-render — observe for new inputs.
+        new MutationObserver(apply).observe(root.body, {childList: true, subtree: true});
+        </script>
+        """,
+        height=0,
+    )
+
+    with st.form("analyze_form", clear_on_submit=False):
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            raw = st.text_input(
+                "Ticker", placeholder="e.g. NVDA, TSLA, PLTR",
+                label_visibility="collapsed",
+            )
+        with col2:
+            submitted = st.form_submit_button("Analyze", type="primary", use_container_width=True)
+
+    # Determine which ticker to render. Either just submitted, or sticky from
+    # the last submit in this session.
+    if submitted:
+        sym = normalize_ticker(raw)
+        if not sym:
+            st.error("Enter a valid US ticker (e.g. NVDA, BRK.B).")
+            return
+        st.session_state["analyze_current"] = sym
+    else:
+        sym = st.session_state.get("analyze_current")
+        if not sym:
+            return
+
+    nonces = st.session_state.setdefault("analyze_nonces", {})
+    nonce = nonces.get(sym, 0)
+
+    with st.status(f"📡 Analyzing {sym}…", expanded=True) as s:
+        s.write("Fetching FMP, Polygon, and Grok in parallel…")
+        s.write("Asking Claude to synthesize…")
+        analysis, fetched_at = get_analysis(sym, nonce, hot, flows)
+        s.update(label=f"✅ Analysis ready for {sym}", state="complete", expanded=False)
+
+    # Manual refresh — bumps nonce so the next call is a cache miss.
+    refresh_col = st.columns([1, 4])[0]
+    if refresh_col.button("🔄 Refresh", key=f"refresh_{sym}", use_container_width=True):
+        nonces[sym] = nonce + 1
+        st.rerun()
+
+    if analysis is None:
+        st.error(f"Analysis failed for {sym}. Check the error panel below.")
+        return
+
+    # Header strip with key numbers.
+    cols = st.columns(4)
+    cols[0].metric(
+        "Price",
+        f"${analysis.quote.price:,.2f}" if analysis.quote else "—",
+        delta=(
+            f"{analysis.quote.change_pct:+.2f}%"
+            if analysis.quote and analysis.quote.change_pct is not None else None
+        ),
+    )
+    cols[1].metric(
+        "Analyst Upside",
+        f"{analysis.analyst_upside_pct:+.1f}%" if analysis.analyst_upside_pct is not None else "—",
+        help=(
+            f"Consensus ${analysis.target.target_consensus}"
+            if analysis.target and analysis.target.target_consensus else None
+        ),
+    )
+    cols[2].metric(
+        "Sentiment (X)",
+        f"{analysis.sentiment.score:+.2f}" if analysis.sentiment else "—",
+    )
+    cols[3].metric(
+        "FlowGod hits",
+        f"{len(analysis.flow_posts)}",
+        help="Posts captured today mentioning this ticker",
+    )
+
+    st.caption(
+        f"Fetched {clock.fmt_dt(fetched_at)} · "
+        f"{len(analysis.news)} news · {len(analysis.hot_mentions)} chatter mentions"
+    )
+
+    st.markdown(analysis.report_markdown)
+
+    # Raw data drilldown for the curious.
+    with st.expander("📂 Raw data used in this analysis"):
+        if analysis.profile:
+            st.markdown(
+                f"**Company:** {analysis.profile.name} · "
+                f"{analysis.profile.sector} / {analysis.profile.industry}  \n"
+                f"Market cap: {_esc(_fmt_mcap(analysis.profile.market_cap))} · "
+                f"Beta: {analysis.profile.beta or '—'}"
+            )
+            if analysis.profile.description:
+                st.caption(analysis.profile.description[:500] + "…")
+        if analysis.news:
+            st.markdown("**Recent headlines:**")
+            for n in analysis.news[:8]:
+                st.markdown(
+                    f"- [{n.title}]({n.url})  \n"
+                    f"  *{n.publisher} · {clock.fmt_dt(n.published_at)}*"
+                )
+        if analysis.sentiment:
+            st.markdown(f"**Grok X-sentiment note:** {analysis.sentiment.summary}")
+        if analysis.flow_posts:
+            st.markdown("**FlowGod mentions today:**")
+            for f in analysis.flow_posts:
+                st.markdown(f"- [{f.conviction}/10] {f.summary}")
+
+
+def _fmt_mcap(x) -> str:
+    if x is None:
+        return "—"
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return "—"
+    if abs(v) >= 1e12:
+        return f"${v/1e12:.2f}T"
+    if abs(v) >= 1e9:
+        return f"${v/1e9:.2f}B"
+    if abs(v) >= 1e6:
+        return f"${v/1e6:.1f}M"
+    return f"${v:,.0f}"
 
 
 def render_flowgod(
@@ -671,18 +844,17 @@ def main() -> None:
     hot, hot_at = get_hot_chatter(chatter_b)
     flows, flows_at = get_flowgod(flowgod_b)
 
+    tab_labels = ["🌅 Pre-Market", "🌇 Post-Market", "🔥 X Chatter",
+                  "🌊 FlowGod", "🔍 Analyze"]
     if auth.is_owner():
-        tab_dash, tab_pre, tab_post, tab_chat, tab_flow = st.tabs(
-            ["📊 Dashboard", "🌅 Pre-Market", "🌇 Post-Market",
-             "🔥 X Chatter", "🌊 FlowGod"]
-        )
-        with tab_dash:
+        tab_labels = ["📊 Dashboard"] + tab_labels
+        tabs = st.tabs(tab_labels)
+        with tabs[0]:
             render_dashboard()
+        tab_pre, tab_post, tab_chat, tab_flow, tab_analyze = tabs[1:]
     else:
-        tab_pre, tab_post, tab_chat, tab_flow = st.tabs(
-            ["🌅 Pre-Market", "🌇 Post-Market",
-             "🔥 X Chatter", "🌊 FlowGod"]
-        )
+        tabs = st.tabs(tab_labels)
+        tab_pre, tab_post, tab_chat, tab_flow, tab_analyze = tabs
 
     with tab_pre:
         briefing, briefing_at = get_pre_briefing(pre_b, hot)
@@ -697,6 +869,9 @@ def main() -> None:
 
     with tab_flow:
         render_flowgod(flows, flows_at, flowgod_next, set(TICKERS))
+
+    with tab_analyze:
+        render_analyze(hot, flows)
 
     # ---- Errors panel ----
     if _FETCH_ERRORS:

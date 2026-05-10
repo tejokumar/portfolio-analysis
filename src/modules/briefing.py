@@ -22,7 +22,7 @@ from src.clients import fmp, grok, llm, polygon
 from src.clients.fmp import EarningsEvent, EconomicEvent
 from src.clients.grok import HotTicker
 from src.clients.polygon import NewsItem
-from src.config import ANALYST_SYSTEM_PROMPT, SETTINGS, TICKER_ROLES
+from src.config import MARKET_SYSTEM_PROMPT, SETTINGS, TICKER_ROLES
 
 Mode = Literal["pre", "post"]
 
@@ -263,7 +263,7 @@ def generate_briefing(
             system=[
                 {
                     "type": "text",
-                    "text": ANALYST_SYSTEM_PROMPT,
+                    "text": MARKET_SYSTEM_PROMPT,
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
