@@ -171,36 +171,80 @@ def next_post_briefing(n: datetime | None = None) -> datetime:
     return _at(_next_weekday(n), POST_BRIEFING_REFRESH)
 
 
-# ---- X Hot Chatter: every 15 minutes, 24/7 ----
+# ---- Active polling window (X Chatter + FlowGod) ----
+# Both are scoped to weekday 09:15 ET pre-market through 17:00 ET (1 hr after
+# close). Outside that window, the bucket key freezes to the last in-window
+# slot so cached data persists and no Grok calls fire.
+
+ACTIVE_WINDOW_START = PRE_BRIEFING_REFRESH   # 09:15 ET
+ACTIVE_WINDOW_END = POST_BRIEFING_REFRESH    # 17:00 ET
+
+
+def in_active_window(n: datetime | None = None) -> bool:
+    n = n or now_et()
+    return is_weekday(n) and ACTIVE_WINDOW_START <= n.time() < ACTIVE_WINDOW_END
+
+
+def _last_active_dt(n: datetime) -> datetime:
+    """Most recent in-window moment ≤ n. Used to anchor off-hours bucket keys
+    to the final in-window slot so the cache stays warm."""
+    if in_active_window(n):
+        return n
+    if is_weekday(n) and n.time() >= ACTIVE_WINDOW_END:
+        # Today's window has already closed — anchor to its final minute.
+        return _at(n, ACTIVE_WINDOW_END) - timedelta(minutes=1)
+    # Before today's window opens, or weekend: roll back to previous weekday's close.
+    prev = _previous_weekday(n)
+    return _at(prev, ACTIVE_WINDOW_END) - timedelta(minutes=1)
+
+
+def _next_active_open(n: datetime) -> datetime:
+    """When does the next in-window period start?"""
+    if is_weekday(n) and n.time() < ACTIVE_WINDOW_START:
+        return _at(n, ACTIVE_WINDOW_START)
+    return _at(_next_weekday(n), ACTIVE_WINDOW_START)
+
+
+def _slot_bucket(dt_: datetime, slot_size_min: int, suffix: str) -> str:
+    slot = (dt_.minute // slot_size_min) * slot_size_min
+    return dt_.strftime(f"%Y%m%d-{dt_.hour:02d}{slot:02d}-{suffix}")
+
+
+def _next_slot_dt(n: datetime, slot_size_min: int) -> datetime:
+    next_min = ((n.minute // slot_size_min) + 1) * slot_size_min
+    if next_min < 60:
+        return n.replace(minute=next_min, second=0, microsecond=0)
+    return n.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+
+
+# ---- X Hot Chatter: every 15 minutes during active window ----
 
 def chatter_bucket(n: datetime | None = None) -> str:
     n = n or now_et()
-    slot_min = (n.minute // 15) * 15
-    return n.strftime(f"%Y%m%d-{n.hour:02d}{slot_min:02d}")
+    eff = n if in_active_window(n) else _last_active_dt(n)
+    return _slot_bucket(eff, 15, "chat")
 
 
 def next_chatter_refresh(n: datetime | None = None) -> datetime:
     n = n or now_et()
-    next_min = ((n.minute // 15) + 1) * 15
-    if next_min >= 60:
-        return (n.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
-    return n.replace(minute=next_min, second=0, microsecond=0)
+    if in_active_window(n):
+        return _next_slot_dt(n, 15)
+    return _next_active_open(n)
 
 
-# ---- FlowGod: every 10 minutes, 24/7 (poll @flowgod options flow) ----
+# ---- FlowGod: every 10 minutes during active window ----
 
 def flowgod_bucket(n: datetime | None = None) -> str:
     n = n or now_et()
-    slot_min = (n.minute // 10) * 10
-    return n.strftime(f"%Y%m%d-{n.hour:02d}{slot_min:02d}-flow")
+    eff = n if in_active_window(n) else _last_active_dt(n)
+    return _slot_bucket(eff, 10, "flow")
 
 
 def next_flowgod_refresh(n: datetime | None = None) -> datetime:
     n = n or now_et()
-    next_min = ((n.minute // 10) + 1) * 10
-    if next_min >= 60:
-        return (n.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
-    return n.replace(minute=next_min, second=0, microsecond=0)
+    if in_active_window(n):
+        return _next_slot_dt(n, 10)
+    return _next_active_open(n)
 
 
 # ---- Display helpers ----

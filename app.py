@@ -209,9 +209,14 @@ def render_chatter(
 ) -> None:
     st.subheader("X Hot Chatter")
     render_freshness_caption("Chatter", fetched, nxt)
+    if not clock.in_active_window():
+        st.caption(
+            "💤 Polling paused outside market hours. Showing last in-window data."
+        )
     st.caption(
         "Grok scans X for the most-discussed US tickers in the last 12-24h, "
-        "filtered to verified financial accounts. Refreshes every 15 min."
+        "filtered to verified financial accounts. Refreshes every 15 min "
+        "during the 06:15–14:00 PT active window (weekdays)."
     )
     if not hot:
         st.info("No chatter returned. (First refresh may be pending.)")
@@ -245,11 +250,16 @@ def render_flowgod(
 ) -> None:
     st.subheader(f"🌊 @{FLOWGOD_HANDLE} Flow")
     render_freshness_caption("FlowGod", fetched, nxt)
+    if not clock.in_active_window():
+        st.caption(
+            "💤 Polling paused outside market hours. Showing last in-window data."
+        )
     st.caption(
         f"Today's substantive posts from @{FLOWGOD_HANDLE} on X. "
         "Grok inspects attached images (charts / OI tables) and extracts the "
         "ticker, direction, and dollar/share details. Pure-reaction posts are "
-        "filtered out. Refreshes every 10 min."
+        "filtered out. Refreshes every 10 min during the 06:15–14:00 PT active "
+        "window (weekdays)."
     )
     if not flows:
         st.info(
@@ -577,8 +587,8 @@ def main() -> None:
             "- News: 06:15 + every 15 min in-session\n"
             "- Pre-market brief: 06:15 weekdays\n"
             "- Post-market brief: 14:00 weekdays\n"
-            "- X Hot Chatter: every 15 min\n"
-            f"- @{FLOWGOD_HANDLE} flow: every 10 min"
+            "- X Hot Chatter: every 15 min (06:15–14:00 weekdays)\n"
+            f"- @{FLOWGOD_HANDLE} flow: every 10 min (06:15–14:00 weekdays)"
         )
 
     # ---- Warm all caches with visible progress ----
