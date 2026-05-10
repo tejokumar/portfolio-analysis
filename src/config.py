@@ -8,6 +8,28 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# On Streamlit Cloud, secrets live in .streamlit/secrets.toml and aren't auto-
+# exported to os.environ. Bridge them at import time so the rest of the code
+# can keep reading os.environ as usual.
+_SECRET_KEYS = (
+    "SNAPTRADE_CLIENT_ID", "SNAPTRADE_CONSUMER_KEY",
+    "SNAPTRADE_USER_ID", "SNAPTRADE_USER_SECRET",
+    "FMP_API_KEY", "POLYGON_API_KEY",
+    "GROK_API_KEY", "ANTHROPIC_API_KEY",
+    "APP_PASSWORD",
+)
+try:
+    import streamlit as _st  # type: ignore
+    for _k in _SECRET_KEYS:
+        try:
+            v = _st.secrets.get(_k)
+        except (FileNotFoundError, KeyError):
+            v = None
+        if v and not os.getenv(_k):
+            os.environ[_k] = str(v)
+except ImportError:
+    pass
+
 PORTFOLIO_VALUE = 500_000.0
 
 # Target weights from CLAUDE.md. Must sum to 1.0.
