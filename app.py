@@ -667,87 +667,131 @@ def render_allocation(
         _render_rebalance_row(r)
 
 
-def _warm_caches() -> dict:
-    """Fire all cached fetchers up-front with visible progress.
+def _tab_refresh_button(tab_id: str) -> None:
+    """Small 🔄 button in a tab's top-right. Bumps the per-tab nonce so the next
+    cached-fetcher call is a cache miss."""
+    nonces = st.session_state.setdefault("tab_nonces", {})
+    cols = st.columns([10, 1])
+    with cols[1]:
+        if st.button("🔄", key=f"refresh_{tab_id}", help="Refresh this tab"):
+            nonces[tab_id] = nonces.get(tab_id, 0) + 1
+            # Bumping shared inputs too where relevant — handled by caller for
+            # dependencies like chatter (used by briefings).
+            st.rerun()
 
-    On a cold cache the user sees a stepwise status box; on a warm cache the
-    block executes in <100 ms and collapses immediately. Either way, the tab
-    renders below this run against pre-warmed caches and are instant.
+
+def _tab_nonce(tab_id: str) -> int:
+    return st.session_state.get("tab_nonces", {}).get(tab_id, 0)
+
+
+def _swr_render(tab_id: str, fresh_data, render_fn) -> None:
+    """Stale-while-revalidate render pattern.
+
+    fresh_data: the newly-fetched data (may be None or empty if fetch failed)
+    render_fn(data) → renders the panel for that data
+
+    Pulls the last successfully-rendered data out of session_state. If the
+    fresh fetch returned something, uses that and saves it. Otherwise falls
+    back to the stored copy so the panel never blanks out on a failed refresh.
     """
-    chatter_b = clock.chatter_bucket()
-    flowgod_b = clock.flowgod_bucket()
-    pre_b = clock.pre_briefing_bucket()
-    post_b = clock.post_briefing_bucket()
-    holdings_b = clock.holdings_bucket()
-    daily_b = clock.daily_premarket_bucket()
-    news_b = clock.news_bucket()
-    verdict_b = f"{daily_b}|{news_b}"
+    key = f"swr_{tab_id}"
+    if fresh_data:
+        st.session_state[key] = fresh_data
+        render_fn(fresh_data)
+        return
+    stored = st.session_state.get(key)
+    if stored:
+        st.warning("Refresh returned no data — showing the last successful fetch.")
+        render_fn(stored)
+    else:
+        st.info("No data yet. Tap 🔄 to retry.")
 
-    owner = auth.is_owner()
 
-    with st.status("📡 Loading data…", expanded=True) as s:
-        if owner:
-            s.write("📊 Holdings (SnapTrade)…")
-            holdings, _ = get_holdings(holdings_b)
-            s.write(f"   → {len(holdings)} positions" if holdings else "   → using mock holdings")
-        else:
-            s.write("📊 Holdings — skipped (guest mode)")
+def _nonced(bucket: str, tab_id: str) -> str:
+    """Combine a bucket key with the tab's refresh nonce so manual refresh
+    bypasses cache without clearing other tabs."""
+    n = _tab_nonce(tab_id)
+    return f"{bucket}|n{n}" if n else bucket
 
-        s.write("💹 Quotes & analyst targets (FMP)…")
-        quotes, _ = get_quotes(tuple(TICKERS), daily_b)
-        targets, _ = get_targets(tuple(TICKERS), daily_b)
-        s.write(f"   → {len(quotes)} quotes · {len(targets)} targets")
 
-        s.write("📰 News headlines (Polygon)…")
-        news, _ = get_news(tuple(TICKERS), news_b)
-        s.write(f"   → {len(news)} headlines")
-
-        s.write("🐦 X sentiment + hot chatter + FlowGod (Grok, parallel)…")
-        with ThreadPoolExecutor(max_workers=3) as ex:
-            f_sent = ex.submit(get_sentiment, tuple(TICKERS), daily_b)
-            f_hot = ex.submit(get_hot_chatter, chatter_b)
-            f_flow = ex.submit(get_flowgod, flowgod_b)
-            sentiments, _ = f_sent.result()
-            hot, _ = f_hot.result()
-            flows, _ = f_flow.result()
-        s.write(
-            f"   → {len(sentiments)} sentiments · {len(hot)} hot tickers · "
-            f"{len(flows)} FlowGod posts"
-        )
-
-        if llm.is_configured():
-            if owner:
-                quotes_for_cards, _ = get_quotes(tuple(TICKERS), daily_b)
-                targets_for_cards, _ = get_targets(tuple(TICKERS), daily_b)
-                holdings_for_cards, _ = get_holdings(holdings_b)
-                if not quotes_for_cards:
-                    quotes_for_cards = mock_quotes()
-                if not holdings_for_cards:
-                    holdings_for_cards = mock_holdings()
-
-                s.write("🤖 Per-ticker verdicts + recommended actions (Claude, parallel)…")
-                cards, _ = get_scorecards(
-                    tuple(TICKERS), verdict_b,
-                    quotes_for_cards, targets_for_cards, news, sentiments,
-                    holdings_for_cards,
-                )
-                s.write(f"   → {len(cards)} verdicts synthesized")
+def _render_tab_dashboard() -> None:
+    _tab_refresh_button("dashboard")
+    with st.spinner("Loading dashboard…"):
+        try:
+            render_dashboard()
+        except Exception as exc:  # noqa: BLE001
+            stored = st.session_state.get("swr_dashboard_ok")
+            if stored:
+                st.warning(f"Refresh failed: {exc}. Showing last successful view.")
             else:
-                s.write("🤖 Verdicts — skipped (guest mode)")
+                st.error(f"Failed to load dashboard: {exc}")
+    st.session_state["swr_dashboard_ok"] = True
 
-            s.write("📅 Pre-market + post-market briefings (Claude, parallel)…")
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                f_pre = ex.submit(get_pre_briefing, pre_b, hot)
-                f_post = ex.submit(get_post_briefing, post_b, hot)
-                f_pre.result()
-                f_post.result()
-            s.write("   → Both briefings ready")
+
+def _render_tab_briefing(
+    mode: str,        # "pre" | "post"
+    base_bucket: str,
+    chatter_b: str,
+    nxt: datetime,
+    label: str,
+) -> None:
+    _tab_refresh_button(mode)
+    nonced_brief = _nonced(base_bucket, mode)
+    nonced_chat = _nonced(chatter_b, "chatter_shared")
+    with st.spinner(f"Loading {label.lower()}…"):
+        hot, _ = get_hot_chatter(nonced_chat)
+        if mode == "pre":
+            briefing, at = get_pre_briefing(nonced_brief, hot)
         else:
-            s.write("⚠️  ANTHROPIC_API_KEY not set — verdicts/briefings disabled.")
+            briefing, at = get_post_briefing(nonced_brief, hot)
 
-        s.update(label="✅ All data ready", state="complete", expanded=False)
+    def _render(payload):
+        b, t = payload
+        render_briefing(label, b, t, nxt)
 
-    return {"warmed_at": clock.now_et()}
+    _swr_render(mode, (briefing, at) if briefing else None, _render)
+
+
+def _render_tab_chatter(chatter_b: str, chatter_next: datetime) -> None:
+    _tab_refresh_button("chatter")
+    nonced = _nonced(chatter_b, "chatter")
+    with st.spinner("Loading X chatter…"):
+        hot, hot_at = get_hot_chatter(nonced)
+
+    def _render(payload):
+        h, h_at = payload
+        render_chatter(h, h_at, chatter_next, set(TICKERS))
+
+    _swr_render("chatter", (hot, hot_at) if hot else None, _render)
+
+
+def _render_tab_flowgod(flowgod_b: str, flowgod_next: datetime) -> None:
+    _tab_refresh_button("flowgod")
+    nonced = _nonced(flowgod_b, "flowgod")
+    with st.spinner("Loading FlowGod posts…"):
+        flows, flows_at = get_flowgod(nonced)
+
+    def _render(payload):
+        f, f_at = payload
+        render_flowgod(f, f_at, flowgod_next, set(TICKERS))
+
+    # Render even when empty — empty is a valid state (e.g., Sunday, no posts).
+    if flows or "swr_flowgod" not in st.session_state:
+        st.session_state["swr_flowgod"] = (flows, flows_at)
+    stored = st.session_state.get("swr_flowgod")
+    if stored:
+        _render(stored)
+    else:
+        st.info("No FlowGod posts yet. Tap 🔄 to retry.")
+
+
+def _render_tab_analyze(chatter_b: str, flowgod_b: str) -> None:
+    """Analyze tab has its own internal refresh (per-ticker nonce). No tab-level
+    refresh needed since each analysis is keyed by ticker."""
+    # Pull shared cached data (cache hits if other tabs have populated).
+    hot, _ = get_hot_chatter(chatter_b)
+    flows, _ = get_flowgod(flowgod_b)
+    render_analyze(hot, flows)
 
 
 def render_dashboard() -> None:
@@ -828,10 +872,8 @@ def main() -> None:
             ]
         st.markdown("\n".join(schedule_items))
 
-    # ---- Warm all caches with visible progress ----
-    _warm_caches()
-
-    # ---- Tabs (all instant — caches are warm) ----
+    # Bucket keys (instant — just strings). Scheduled refreshes still drive
+    # cache invalidation; only the UI blocking is removed.
     chatter_b = clock.chatter_bucket()
     chatter_next = clock.next_chatter_refresh()
     flowgod_b = clock.flowgod_bucket()
@@ -840,8 +882,6 @@ def main() -> None:
     pre_next = clock.next_pre_briefing()
     post_b = clock.post_briefing_bucket()
     post_next = clock.next_post_briefing()
-    hot, hot_at = get_hot_chatter(chatter_b)
-    flows, flows_at = get_flowgod(flowgod_b)
 
     tab_labels = ["🌅 Pre-Market", "🌇 Post-Market", "🔥 X Chatter",
                   "🌊 FlowGod", "🔍 Analyze"]
@@ -849,28 +889,26 @@ def main() -> None:
         tab_labels = ["📊 Dashboard"] + tab_labels
         tabs = st.tabs(tab_labels)
         with tabs[0]:
-            render_dashboard()
+            _render_tab_dashboard()
         tab_pre, tab_post, tab_chat, tab_flow, tab_analyze = tabs[1:]
     else:
         tabs = st.tabs(tab_labels)
         tab_pre, tab_post, tab_chat, tab_flow, tab_analyze = tabs
 
     with tab_pre:
-        briefing, briefing_at = get_pre_briefing(pre_b, hot)
-        render_briefing("Pre-Market Brief", briefing, briefing_at, pre_next)
+        _render_tab_briefing("pre", pre_b, chatter_b, pre_next, "Pre-Market Brief")
 
     with tab_post:
-        briefing, briefing_at = get_post_briefing(post_b, hot)
-        render_briefing("Post-Market Brief", briefing, briefing_at, post_next)
+        _render_tab_briefing("post", post_b, chatter_b, post_next, "Post-Market Brief")
 
     with tab_chat:
-        render_chatter(hot, hot_at, chatter_next, set(TICKERS))
+        _render_tab_chatter(chatter_b, chatter_next)
 
     with tab_flow:
-        render_flowgod(flows, flows_at, flowgod_next, set(TICKERS))
+        _render_tab_flowgod(flowgod_b, flowgod_next)
 
     with tab_analyze:
-        render_analyze(hot, flows)
+        _render_tab_analyze(chatter_b, flowgod_b)
 
     # ---- Errors panel ----
     if _FETCH_ERRORS:
