@@ -87,6 +87,41 @@ def _reset_state(key: str) -> None:
     with _FETCH_LOCK:
         _FETCH_STATE.pop(key, None)
 
+
+def _refresh_nonce(tab_id: str) -> int:
+    """Per-tab user-triggered refresh counter. Bumped on 🔄 click so the
+    cached fetcher sees a different bucket arg → cache miss → real fetch."""
+    return st.session_state.get("refresh_nonces", {}).get(tab_id, 0)
+
+
+def _bump_refresh_nonce(tab_id: str) -> None:
+    nonces = st.session_state.setdefault("refresh_nonces", {})
+    nonces[tab_id] = nonces.get(tab_id, 0) + 1
+
+
+def _nonced(bucket: str, tab_id: str) -> str:
+    """Append the tab's refresh nonce to a bucket string."""
+    n = _refresh_nonce(tab_id)
+    return f"{bucket}|n{n}" if n else bucket
+
+
+def _refresh_button(tab_id: str, fetch_key: str) -> None:
+    """🔄 button for a tab. Disabled when the matching fetch is in flight.
+    Click bumps the nonce (forcing a real refetch) and reruns; the next render
+    spawns a new bg thread for the new key."""
+    in_flight = _fetch_status(fetch_key) == "in_flight"
+    label = "⟳" if in_flight else "🔄"
+    help_text = "Refresh in progress…" if in_flight else "Force refresh this tab"
+    cols = st.columns([10, 1])
+    with cols[1]:
+        if st.button(
+            label, key=f"refresh_{tab_id}",
+            disabled=in_flight, help=help_text,
+            use_container_width=True,
+        ):
+            _bump_refresh_nonce(tab_id)
+            st.rerun()
+
 from src import auth, clock
 from src.clients import fmp, grok, llm, polygon, snaptrade
 from src.clients.fmp import AnalystTarget, Quote
@@ -794,53 +829,6 @@ def _kickoff_background_fetches(
         _start_bg(f"verdict:{verdict_b}", _verdict_chain)
 
 
-def _tab_refresh_button(tab_id: str) -> None:
-    """Small 🔄 button in a tab's top-right. Bumps the per-tab nonce so the next
-    cached-fetcher call is a cache miss."""
-    nonces = st.session_state.setdefault("tab_nonces", {})
-    cols = st.columns([10, 1])
-    with cols[1]:
-        if st.button("🔄", key=f"refresh_{tab_id}", help="Refresh this tab"):
-            nonces[tab_id] = nonces.get(tab_id, 0) + 1
-            # Bumping shared inputs too where relevant — handled by caller for
-            # dependencies like chatter (used by briefings).
-            st.rerun()
-
-
-def _tab_nonce(tab_id: str) -> int:
-    return st.session_state.get("tab_nonces", {}).get(tab_id, 0)
-
-
-def _swr_render(tab_id: str, fresh_data, render_fn) -> None:
-    """Stale-while-revalidate render pattern.
-
-    fresh_data: the newly-fetched data (may be None or empty if fetch failed)
-    render_fn(data) → renders the panel for that data
-
-    Pulls the last successfully-rendered data out of session_state. If the
-    fresh fetch returned something, uses that and saves it. Otherwise falls
-    back to the stored copy so the panel never blanks out on a failed refresh.
-    """
-    key = f"swr_{tab_id}"
-    if fresh_data:
-        st.session_state[key] = fresh_data
-        render_fn(fresh_data)
-        return
-    stored = st.session_state.get(key)
-    if stored:
-        st.warning("Refresh returned no data — showing the last successful fetch.")
-        render_fn(stored)
-    else:
-        st.info("No data yet. Tap 🔄 to retry.")
-
-
-def _nonced(bucket: str, tab_id: str) -> str:
-    """Combine a bucket key with the tab's refresh nonce so manual refresh
-    bypasses cache without clearing other tabs."""
-    n = _tab_nonce(tab_id)
-    return f"{bucket}|n{n}" if n else bucket
-
-
 def _ready_or_placeholder(
     fetch_keys: list[str],
     label: str,
@@ -868,17 +856,24 @@ def _ready_or_placeholder(
 
 
 def _render_tab_dashboard(holdings_b, daily_b, news_b, verdict_b) -> None:
-    if st.button("🔄", key="refresh_dashboard", help="Refresh dashboard"):
-        for k in (
-            f"hold:{holdings_b}", f"quotes:{daily_b}", f"targets:{daily_b}",
-            f"news:{news_b}", f"sent:{daily_b}", f"verdict:{verdict_b}",
-        ):
-            _reset_state(k)
-        st.rerun()
-
+    # Disable button if any of the underlying fetches are still in flight.
     keys = [
         f"hold:{holdings_b}", f"quotes:{daily_b}", f"verdict:{verdict_b}",
     ]
+    any_in_flight = any(_fetch_status(k) == "in_flight" for k in keys)
+    cols = st.columns([10, 1])
+    with cols[1]:
+        if st.button(
+            "⟳" if any_in_flight else "🔄",
+            key="refresh_dashboard",
+            disabled=any_in_flight,
+            help="Refresh in progress…" if any_in_flight else "Force refresh dashboard",
+            use_container_width=True,
+        ):
+            _bump_refresh_nonce("dashboard")
+            st.rerun()
+    if any_in_flight:
+        st.caption("🔁 Refreshing dashboard in background…")
     if not _ready_or_placeholder(keys, "dashboard"):
         return
 
@@ -900,9 +895,9 @@ def _render_tab_briefing(
     label: str,
 ) -> None:
     brief_key = f"{mode}:{base_bucket}"
-    if st.button("🔄", key=f"refresh_{mode}", help=f"Refresh {label}"):
-        _reset_state(brief_key)
-        st.rerun()
+    _refresh_button(mode, brief_key)
+    if _fetch_status(brief_key) == "in_flight":
+        st.caption(f"🔁 Refreshing {label.lower()} in background…")
 
     def _render(payload):
         b, t = payload
@@ -932,9 +927,9 @@ def _render_tab_briefing(
 
 def _render_tab_chatter(chatter_b: str, chatter_next: datetime) -> None:
     key = f"chat:{chatter_b}"
-    if st.button("🔄", key="refresh_chatter", help="Refresh chatter"):
-        _reset_state(key)
-        st.rerun()
+    _refresh_button("chatter", key)
+    if _fetch_status(key) == "in_flight":
+        st.caption("🔁 Refreshing X chatter in background…")
 
     def _render(payload):
         h, h_at = payload
@@ -960,9 +955,9 @@ def _render_tab_chatter(chatter_b: str, chatter_next: datetime) -> None:
 
 def _render_tab_flowgod(flowgod_b: str, flowgod_next: datetime) -> None:
     key = f"flow:{flowgod_b}"
-    if st.button("🔄", key="refresh_flowgod", help="Refresh FlowGod"):
-        _reset_state(key)
-        st.rerun()
+    _refresh_button("flowgod", key)
+    if _fetch_status(key) == "in_flight":
+        st.caption("🔁 Refreshing FlowGod in background…")
 
     def _render(payload):
         f, f_at = payload
@@ -1075,18 +1070,22 @@ def main() -> None:
         st.markdown("\n".join(schedule_items))
 
     # Bucket keys (instant — just strings). Scheduled refreshes still drive
-    # cache invalidation; only the UI blocking is removed.
-    chatter_b = clock.chatter_bucket()
+    # cache invalidation; user-initiated refresh bumps a per-tab nonce that
+    # gets appended to each affected bucket key.
+    chatter_b = _nonced(clock.chatter_bucket(), "chatter")
     chatter_next = clock.next_chatter_refresh()
-    flowgod_b = clock.flowgod_bucket()
+    flowgod_b = _nonced(clock.flowgod_bucket(), "flowgod")
     flowgod_next = clock.next_flowgod_refresh()
-    pre_b = clock.pre_briefing_bucket()
+    pre_b = _nonced(clock.pre_briefing_bucket(), "pre")
     pre_next = clock.next_pre_briefing()
-    post_b = clock.post_briefing_bucket()
+    post_b = _nonced(clock.post_briefing_bucket(), "post")
     post_next = clock.next_post_briefing()
-    holdings_b = clock.holdings_bucket()
-    daily_b = clock.daily_premarket_bucket()
-    news_b = clock.news_bucket()
+    # Dashboard refresh bumps a single "dashboard" nonce that all its buckets share.
+    dash_n = _refresh_nonce("dashboard")
+    dash_suffix = f"|nd{dash_n}" if dash_n else ""
+    holdings_b = clock.holdings_bucket() + dash_suffix
+    daily_b = clock.daily_premarket_bucket() + dash_suffix
+    news_b = clock.news_bucket() + dash_suffix
     verdict_b = f"{daily_b}|{news_b}"
 
     # Fire-and-forget background fetches. Doesn't block; tabs render below
