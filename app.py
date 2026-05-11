@@ -23,6 +23,70 @@ import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
 
+try:
+    from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+except ImportError:
+    add_script_run_ctx = None  # type: ignore[assignment]
+    get_script_run_ctx = None  # type: ignore[assignment]
+
+
+# ---------- background-thread fetch coordinator ----------
+# Tracks the state of each in-flight fetch so the main render thread can show
+# a placeholder + stale data instead of blocking on the fetcher.
+
+_FETCH_STATE: dict[str, str] = {}      # key → "in_flight" | "ready" | "error"
+_FETCH_LOCK = threading.Lock()
+
+
+def _start_bg(key: str, fn, *args, **kwargs) -> str:
+    """Spawn a background thread to run `fn(*args, **kwargs)` if not already
+    running. The fetcher's @st.cache_data layer dedupes the actual API call;
+    this layer just tracks completion so the UI knows when to switch from
+    'loading' placeholder to real data. Returns the current state."""
+    with _FETCH_LOCK:
+        existing = _FETCH_STATE.get(key)
+        if existing in ("in_flight", "ready"):
+            return existing
+        _FETCH_STATE[key] = "in_flight"
+
+    def _run():
+        try:
+            fn(*args, **kwargs)
+            new_state = "ready"
+        except Exception:  # noqa: BLE001
+            new_state = "error"
+        with _FETCH_LOCK:
+            _FETCH_STATE[key] = new_state
+
+    t = threading.Thread(target=_run, daemon=True, name=f"fetch_{key[:32]}")
+    # Attach script context so st.cache_data calls inside the thread work.
+    if add_script_run_ctx is not None and get_script_run_ctx is not None:
+        ctx = get_script_run_ctx()
+        if ctx is not None:
+            try:
+                add_script_run_ctx(t, ctx)
+            except Exception:  # noqa: BLE001
+                pass
+    t.start()
+    return "in_flight"
+
+
+def _fetch_status(key: str) -> str:
+    with _FETCH_LOCK:
+        return _FETCH_STATE.get(key, "pending")
+
+
+def _any_loading() -> bool:
+    with _FETCH_LOCK:
+        return any(s == "in_flight" for s in _FETCH_STATE.values())
+
+
+def _reset_state(key: str) -> None:
+    """Drop state for a key so the next _start_bg actually re-fires
+    (used by per-tab refresh + bucket rollovers via different keys)."""
+    with _FETCH_LOCK:
+        _FETCH_STATE.pop(key, None)
+
 from src import auth, clock
 from src.clients import fmp, grok, llm, polygon, snaptrade
 from src.clients.fmp import AnalystTarget, Quote
@@ -668,7 +732,7 @@ def render_allocation(
         _render_rebalance_row(r)
 
 
-def _prewarm_parallel(
+def _kickoff_background_fetches(
     *,
     owner: bool,
     chatter_b: str,
@@ -680,67 +744,54 @@ def _prewarm_parallel(
     news_b: str,
     verdict_b: str,
 ) -> None:
-    """Fan out every independent data fetch in parallel.
+    """Spawn background threads for every independent data source. Non-blocking.
 
-    Splits into two waves because briefings + verdicts depend on chatter/news/
-    sentiment. Wave 1: raw data sources (Polygon, FMP, Grok). Wave 2: anything
-    needing wave 1's results (Claude synthesis).
-
-    Each call hits @st.cache_data, so if it's already cached the call returns
-    instantly. On a cold start, every wave-1 call runs in its own thread; total
-    time is bounded by the slowest, not the sum.
+    Returns immediately. Tabs render with stale/empty data while threads
+    populate st.cache_data. The 'in_flight/ready' state is tracked in
+    _FETCH_STATE so each tab can show a loading placeholder if its key isn't
+    ready yet, and switch to the real data on the next rerun.
     """
-    if not llm.is_configured():
-        # Without Claude, just warm the raw sources.
-        pass
+    # ---- Independent sources ----
+    _start_bg(f"chat:{chatter_b}", get_hot_chatter, chatter_b)
+    _start_bg(f"flow:{flowgod_b}", get_flowgod, flowgod_b)
+    _start_bg(f"quotes:{daily_b}", get_quotes, tuple(TICKERS), daily_b)
+    _start_bg(f"targets:{daily_b}", get_targets, tuple(TICKERS), daily_b)
+    _start_bg(f"news:{news_b}", get_news, tuple(TICKERS), news_b)
+    _start_bg(f"sent:{daily_b}", get_sentiment, tuple(TICKERS), daily_b)
+    if owner:
+        _start_bg(f"hold:{holdings_b}", get_holdings, holdings_b)
 
-    def _ignore(fn, *args):
-        try:
-            fn(*args)
-        except Exception:  # noqa: BLE001
-            pass
+    # ---- Briefings depend on chatter — chain inside the thread ----
+    def _pre_chain():
+        hot, _ = get_hot_chatter(chatter_b)
+        get_pre_briefing(pre_b, hot)
 
-    spinner_msg = "Loading all tabs in parallel…"
-    with st.spinner(spinner_msg):
-        # ---- Wave 1: independent data sources (parallel) ----
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            futs = []
-            futs.append(ex.submit(_ignore, get_quotes, tuple(TICKERS), daily_b))
-            futs.append(ex.submit(_ignore, get_targets, tuple(TICKERS), daily_b))
-            futs.append(ex.submit(_ignore, get_news, tuple(TICKERS), news_b))
-            futs.append(ex.submit(_ignore, get_sentiment, tuple(TICKERS), daily_b))
-            futs.append(ex.submit(_ignore, get_hot_chatter, chatter_b))
-            futs.append(ex.submit(_ignore, get_flowgod, flowgod_b))
-            if owner:
-                futs.append(ex.submit(_ignore, get_holdings, holdings_b))
-            for f in futs:
-                f.result()
+    def _post_chain():
+        hot, _ = get_hot_chatter(chatter_b)
+        get_post_briefing(post_b, hot)
 
-        # ---- Wave 2: things that need wave 1's output (parallel) ----
-        hot, _ = get_hot_chatter(chatter_b)  # cache hit
-        if llm.is_configured():
-            with ThreadPoolExecutor(max_workers=4) as ex:
-                futs = []
-                futs.append(ex.submit(_ignore, get_pre_briefing, pre_b, hot))
-                futs.append(ex.submit(_ignore, get_post_briefing, post_b, hot))
-                if owner:
-                    quotes, _ = get_quotes(tuple(TICKERS), daily_b)
-                    targets, _ = get_targets(tuple(TICKERS), daily_b)
-                    holdings_obj, _ = get_holdings(holdings_b)
-                    news_obj, _ = get_news(tuple(TICKERS), news_b)
-                    sentiments_obj, _ = get_sentiment(tuple(TICKERS), daily_b)
-                    if not quotes:
-                        quotes = mock_quotes()
-                    if not holdings_obj:
-                        holdings_obj = mock_holdings()
-                    futs.append(
-                        ex.submit(
-                            _ignore, get_scorecards, tuple(TICKERS), verdict_b,
-                            quotes, targets, news_obj, sentiments_obj, holdings_obj,
-                        )
-                    )
-                for f in futs:
-                    f.result()
+    if llm.is_configured():
+        _start_bg(f"pre:{pre_b}", _pre_chain)
+        _start_bg(f"post:{post_b}", _post_chain)
+
+    # ---- Verdicts depend on holdings + quotes + targets + news + sentiments ----
+    if owner and llm.is_configured():
+        def _verdict_chain():
+            quotes, _ = get_quotes(tuple(TICKERS), daily_b)
+            targets, _ = get_targets(tuple(TICKERS), daily_b)
+            news_obj, _ = get_news(tuple(TICKERS), news_b)
+            sentiments_obj, _ = get_sentiment(tuple(TICKERS), daily_b)
+            holdings_obj, _ = get_holdings(holdings_b)
+            if not quotes:
+                quotes = mock_quotes()
+            if not holdings_obj:
+                holdings_obj = mock_holdings()
+            get_scorecards(
+                tuple(TICKERS), verdict_b,
+                quotes, targets, news_obj, sentiments_obj, holdings_obj,
+            )
+
+        _start_bg(f"verdict:{verdict_b}", _verdict_chain)
 
 
 def _tab_refresh_button(tab_id: str) -> None:
@@ -790,83 +841,155 @@ def _nonced(bucket: str, tab_id: str) -> str:
     return f"{bucket}|n{n}" if n else bucket
 
 
-def _render_tab_dashboard() -> None:
-    _tab_refresh_button("dashboard")
-    with st.spinner("Loading dashboard…"):
-        try:
-            render_dashboard()
-        except Exception as exc:  # noqa: BLE001
-            stored = st.session_state.get("swr_dashboard_ok")
+def _ready_or_placeholder(
+    fetch_keys: list[str],
+    label: str,
+    stored_session_key: str | None = None,
+    render_stored=None,
+) -> bool:
+    """If any of the named background fetches are still in flight, render a
+    placeholder (with stale data if we have it) and return False so the caller
+    can early-return. Otherwise return True so the caller proceeds with the
+    real render."""
+    statuses = [_fetch_status(k) for k in fetch_keys]
+    if any(s in ("pending", "in_flight") for s in statuses):
+        if stored_session_key and render_stored:
+            stored = st.session_state.get(stored_session_key)
             if stored:
-                st.warning(f"Refresh failed: {exc}. Showing last successful view.")
-            else:
-                st.error(f"Failed to load dashboard: {exc}")
-    st.session_state["swr_dashboard_ok"] = True
+                st.caption(f"⏳ Refreshing {label}…")
+                render_stored(stored)
+                return False
+        st.info(f"⏳ Loading {label}…")
+        return False
+    if all(s == "error" for s in statuses):
+        st.warning(f"⚠️ {label} failed to load. Tap 🔄 to retry.")
+        return False
+    return True
+
+
+def _render_tab_dashboard(holdings_b, daily_b, news_b, verdict_b) -> None:
+    if st.button("🔄", key="refresh_dashboard", help="Refresh dashboard"):
+        for k in (
+            f"hold:{holdings_b}", f"quotes:{daily_b}", f"targets:{daily_b}",
+            f"news:{news_b}", f"sent:{daily_b}", f"verdict:{verdict_b}",
+        ):
+            _reset_state(k)
+        st.rerun()
+
+    keys = [
+        f"hold:{holdings_b}", f"quotes:{daily_b}", f"verdict:{verdict_b}",
+    ]
+    if not _ready_or_placeholder(keys, "dashboard"):
+        return
+
+    try:
+        render_dashboard()
+        st.session_state["swr_dashboard_ok"] = True
+    except Exception as exc:  # noqa: BLE001
+        if st.session_state.get("swr_dashboard_ok"):
+            st.warning(f"Refresh failed: {exc}. Showing last successful view.")
+        else:
+            st.error(f"Failed to load dashboard: {exc}")
 
 
 def _render_tab_briefing(
-    mode: str,        # "pre" | "post"
+    mode: str,
     base_bucket: str,
     chatter_b: str,
     nxt: datetime,
     label: str,
 ) -> None:
-    _tab_refresh_button(mode)
-    nonced_brief = _nonced(base_bucket, mode)
-    nonced_chat = _nonced(chatter_b, "chatter_shared")
-    with st.spinner(f"Loading {label.lower()}…"):
-        hot, _ = get_hot_chatter(nonced_chat)
-        if mode == "pre":
-            briefing, at = get_pre_briefing(nonced_brief, hot)
-        else:
-            briefing, at = get_post_briefing(nonced_brief, hot)
+    brief_key = f"{mode}:{base_bucket}"
+    if st.button("🔄", key=f"refresh_{mode}", help=f"Refresh {label}"):
+        _reset_state(brief_key)
+        st.rerun()
 
     def _render(payload):
         b, t = payload
         render_briefing(label, b, t, nxt)
 
-    _swr_render(mode, (briefing, at) if briefing else None, _render)
+    if not _ready_or_placeholder(
+        [brief_key], label.lower(),
+        stored_session_key=f"swr_{mode}",
+        render_stored=_render,
+    ):
+        return
+
+    if mode == "pre":
+        briefing, at = get_pre_briefing(base_bucket, get_hot_chatter(chatter_b)[0])
+    else:
+        briefing, at = get_post_briefing(base_bucket, get_hot_chatter(chatter_b)[0])
+
+    if briefing:
+        st.session_state[f"swr_{mode}"] = (briefing, at)
+        _render((briefing, at))
+    elif st.session_state.get(f"swr_{mode}"):
+        st.warning("Refresh returned no data — showing last fetch.")
+        _render(st.session_state[f"swr_{mode}"])
+    else:
+        st.error(f"Failed to load {label.lower()}.")
 
 
 def _render_tab_chatter(chatter_b: str, chatter_next: datetime) -> None:
-    _tab_refresh_button("chatter")
-    nonced = _nonced(chatter_b, "chatter")
-    with st.spinner("Loading X chatter…"):
-        hot, hot_at = get_hot_chatter(nonced)
+    key = f"chat:{chatter_b}"
+    if st.button("🔄", key="refresh_chatter", help="Refresh chatter"):
+        _reset_state(key)
+        st.rerun()
 
     def _render(payload):
         h, h_at = payload
         render_chatter(h, h_at, chatter_next, set(TICKERS))
 
-    _swr_render("chatter", (hot, hot_at) if hot else None, _render)
+    if not _ready_or_placeholder(
+        [key], "X chatter",
+        stored_session_key="swr_chatter",
+        render_stored=_render,
+    ):
+        return
+
+    hot, hot_at = get_hot_chatter(chatter_b)
+    if hot:
+        st.session_state["swr_chatter"] = (hot, hot_at)
+        _render((hot, hot_at))
+    elif st.session_state.get("swr_chatter"):
+        st.warning("Refresh returned no data — showing last fetch.")
+        _render(st.session_state["swr_chatter"])
+    else:
+        st.info("No chatter data available yet.")
 
 
 def _render_tab_flowgod(flowgod_b: str, flowgod_next: datetime) -> None:
-    _tab_refresh_button("flowgod")
-    nonced = _nonced(flowgod_b, "flowgod")
-    with st.spinner("Loading FlowGod posts…"):
-        flows, flows_at = get_flowgod(nonced)
+    key = f"flow:{flowgod_b}"
+    if st.button("🔄", key="refresh_flowgod", help="Refresh FlowGod"):
+        _reset_state(key)
+        st.rerun()
 
     def _render(payload):
         f, f_at = payload
         render_flowgod(f, f_at, flowgod_next, set(TICKERS))
 
-    # Render even when empty — empty is a valid state (e.g., Sunday, no posts).
-    if flows or "swr_flowgod" not in st.session_state:
-        st.session_state["swr_flowgod"] = (flows, flows_at)
-    stored = st.session_state.get("swr_flowgod")
-    if stored:
-        _render(stored)
-    else:
-        st.info("No FlowGod posts yet. Tap 🔄 to retry.")
+    if not _ready_or_placeholder(
+        [key], "FlowGod",
+        stored_session_key="swr_flowgod",
+        render_stored=_render,
+    ):
+        return
+
+    flows, flows_at = get_flowgod(flowgod_b)
+    # Empty list is a valid result (Sunday, no posts) — always render.
+    st.session_state["swr_flowgod"] = (flows, flows_at)
+    _render((flows, flows_at))
 
 
 def _render_tab_analyze(chatter_b: str, flowgod_b: str) -> None:
-    """Analyze tab has its own internal refresh (per-ticker nonce). No tab-level
-    refresh needed since each analysis is keyed by ticker."""
-    # Pull shared cached data (cache hits if other tabs have populated).
-    hot, _ = get_hot_chatter(chatter_b)
-    flows, _ = get_flowgod(flowgod_b)
+    """Analyze tab handles its own per-ticker fetch synchronously inside the
+    form submit — that's fine since the user explicitly clicks Analyze and
+    can see the spinner only for that one ticker. Pulls shared chatter/flow
+    from cache (might be empty if those bg fetches haven't finished yet)."""
+    hot_cache = get_hot_chatter(chatter_b)
+    flows_cache = get_flowgod(flowgod_b)
+    hot = hot_cache[0] if hot_cache else []
+    flows = flows_cache[0] if flows_cache else []
     render_analyze(hot, flows)
 
 
@@ -913,8 +1036,11 @@ def render_dashboard() -> None:
 def main() -> None:
     auth.require_password()
 
-    # Re-run every 60s so bucket rollovers cause automatic refetches.
-    st_autorefresh(interval=60_000, key="market_clock_autorefresh")
+    # Adaptive autorefresh: fast (3s) while data is loading so the UI picks up
+    # background-thread completions promptly; slow (60s) once everything is
+    # cached so bucket rollovers still drive refreshes without burning cycles.
+    interval = 3_000 if _any_loading() else 60_000
+    st_autorefresh(interval=interval, key="market_clock_autorefresh")
 
     st.markdown("### 📈 AI Portfolio Advisor")
     status_banner()
@@ -963,9 +1089,10 @@ def main() -> None:
     news_b = clock.news_bucket()
     verdict_b = f"{daily_b}|{news_b}"
 
-    # Fan-out parallel pre-warm — all tabs share one cache-warming pass.
-    # On warm cache this returns in <50 ms.
-    _prewarm_parallel(
+    # Fire-and-forget background fetches. Doesn't block; tabs render below
+    # immediately and pick up data on subsequent reruns (autorefresh polls
+    # every 3s while threads are in flight).
+    _kickoff_background_fetches(
         owner=auth.is_owner(),
         chatter_b=chatter_b, flowgod_b=flowgod_b,
         pre_b=pre_b, post_b=post_b,
@@ -973,13 +1100,20 @@ def main() -> None:
         news_b=news_b, verdict_b=verdict_b,
     )
 
+    if _any_loading():
+        loading_keys = [k.split(":", 1)[0] for k, v in _FETCH_STATE.items() if v == "in_flight"]
+        st.caption(
+            f"⏳ Loading in background: {', '.join(sorted(set(loading_keys)))} "
+            "(tabs populate as data arrives)"
+        )
+
     tab_labels = ["🌅 Pre-Market", "🌇 Post-Market", "🔥 X Chatter",
                   "🌊 FlowGod", "🔍 Analyze"]
     if auth.is_owner():
         tab_labels = ["📊 Dashboard"] + tab_labels
         tabs = st.tabs(tab_labels)
         with tabs[0]:
-            _render_tab_dashboard()
+            _render_tab_dashboard(holdings_b, daily_b, news_b, verdict_b)
         tab_pre, tab_post, tab_chat, tab_flow, tab_analyze = tabs[1:]
     else:
         tabs = st.tabs(tab_labels)
