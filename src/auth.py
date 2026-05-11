@@ -83,11 +83,16 @@ def _verify_token(token: str | None) -> str | None:
     return role
 
 
-@st.cache_resource(show_spinner=False)
 def _cookie_manager():
-    if _COOKIES_AVAILABLE:
+    """CookieManager is a Streamlit widget, so it can't live inside cached
+    functions. Instantiate fresh each call — the `key` arg ensures the
+    underlying iframe component is the same DOM element across reruns."""
+    if not _COOKIES_AVAILABLE:
+        return None
+    try:
         return stx.CookieManager(key="pa_cookie_manager")
-    return None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def is_owner() -> bool:
