@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 import streamlit as st
 
 try:
-    import extra_streamlit_components as stx
+    from streamlit_cookies_controller import CookieController
     _COOKIES_AVAILABLE = True
 except ImportError:
     _COOKIES_AVAILABLE = False
@@ -84,13 +84,12 @@ def _verify_token(token: str | None) -> str | None:
 
 
 def _cookie_manager():
-    """CookieManager is a Streamlit widget, so it can't live inside cached
-    functions. Instantiate fresh each call — the `key` arg ensures the
-    underlying iframe component is the same DOM element across reruns."""
+    """Returns a fresh CookieController per call. The library handles its own
+    iframe deduplication via key."""
     if not _COOKIES_AVAILABLE:
         return None
     try:
-        return stx.CookieManager(key="pa_cookie_manager")
+        return CookieController(key="pa_cookie_ctrl")
     except Exception:  # noqa: BLE001
         return None
 
@@ -147,8 +146,12 @@ def require_password() -> None:
                 st.session_state["role"] = role
                 if cm is not None:
                     try:
-                        expires = datetime.now(timezone.utc) + timedelta(days=COOKIE_TTL_DAYS)
-                        cm.set(COOKIE_NAME, _make_token(role), expires_at=expires)
+                        # streamlit-cookies-controller uses max_age in seconds
+                        cm.set(
+                            COOKIE_NAME,
+                            _make_token(role),
+                            max_age=COOKIE_TTL_DAYS * 86400,
+                        )
                     except Exception:  # noqa: BLE001
                         pass  # cookie set failed — session_state auth still works
                 st.rerun()
@@ -163,6 +166,6 @@ def sign_out() -> None:
     cm = _cookie_manager()
     if cm is not None:
         try:
-            cm.delete(COOKIE_NAME)
+            cm.remove(COOKIE_NAME)
         except Exception:  # noqa: BLE001
             pass

@@ -1,6 +1,6 @@
 streamlit>=1.36
 streamlit-autorefresh>=1.0
-extra-streamlit-components>=0.1.71
+streamlit-cookies-controller>=0.0.4
 pandas>=2.2
 python-dotenv>=1.0
 httpx>=0.27

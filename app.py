@@ -14,6 +14,7 @@ relevant fetcher reruns and the UI updates automatically.
 """
 from __future__ import annotations
 
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -667,6 +668,81 @@ def render_allocation(
         _render_rebalance_row(r)
 
 
+def _prewarm_parallel(
+    *,
+    owner: bool,
+    chatter_b: str,
+    flowgod_b: str,
+    pre_b: str,
+    post_b: str,
+    holdings_b: str,
+    daily_b: str,
+    news_b: str,
+    verdict_b: str,
+) -> None:
+    """Fan out every independent data fetch in parallel.
+
+    Splits into two waves because briefings + verdicts depend on chatter/news/
+    sentiment. Wave 1: raw data sources (Polygon, FMP, Grok). Wave 2: anything
+    needing wave 1's results (Claude synthesis).
+
+    Each call hits @st.cache_data, so if it's already cached the call returns
+    instantly. On a cold start, every wave-1 call runs in its own thread; total
+    time is bounded by the slowest, not the sum.
+    """
+    if not llm.is_configured():
+        # Without Claude, just warm the raw sources.
+        pass
+
+    def _ignore(fn, *args):
+        try:
+            fn(*args)
+        except Exception:  # noqa: BLE001
+            pass
+
+    spinner_msg = "Loading all tabs in parallel…"
+    with st.spinner(spinner_msg):
+        # ---- Wave 1: independent data sources (parallel) ----
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futs = []
+            futs.append(ex.submit(_ignore, get_quotes, tuple(TICKERS), daily_b))
+            futs.append(ex.submit(_ignore, get_targets, tuple(TICKERS), daily_b))
+            futs.append(ex.submit(_ignore, get_news, tuple(TICKERS), news_b))
+            futs.append(ex.submit(_ignore, get_sentiment, tuple(TICKERS), daily_b))
+            futs.append(ex.submit(_ignore, get_hot_chatter, chatter_b))
+            futs.append(ex.submit(_ignore, get_flowgod, flowgod_b))
+            if owner:
+                futs.append(ex.submit(_ignore, get_holdings, holdings_b))
+            for f in futs:
+                f.result()
+
+        # ---- Wave 2: things that need wave 1's output (parallel) ----
+        hot, _ = get_hot_chatter(chatter_b)  # cache hit
+        if llm.is_configured():
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                futs = []
+                futs.append(ex.submit(_ignore, get_pre_briefing, pre_b, hot))
+                futs.append(ex.submit(_ignore, get_post_briefing, post_b, hot))
+                if owner:
+                    quotes, _ = get_quotes(tuple(TICKERS), daily_b)
+                    targets, _ = get_targets(tuple(TICKERS), daily_b)
+                    holdings_obj, _ = get_holdings(holdings_b)
+                    news_obj, _ = get_news(tuple(TICKERS), news_b)
+                    sentiments_obj, _ = get_sentiment(tuple(TICKERS), daily_b)
+                    if not quotes:
+                        quotes = mock_quotes()
+                    if not holdings_obj:
+                        holdings_obj = mock_holdings()
+                    futs.append(
+                        ex.submit(
+                            _ignore, get_scorecards, tuple(TICKERS), verdict_b,
+                            quotes, targets, news_obj, sentiments_obj, holdings_obj,
+                        )
+                    )
+                for f in futs:
+                    f.result()
+
+
 def _tab_refresh_button(tab_id: str) -> None:
     """Small 🔄 button in a tab's top-right. Bumps the per-tab nonce so the next
     cached-fetcher call is a cache miss."""
@@ -882,6 +958,20 @@ def main() -> None:
     pre_next = clock.next_pre_briefing()
     post_b = clock.post_briefing_bucket()
     post_next = clock.next_post_briefing()
+    holdings_b = clock.holdings_bucket()
+    daily_b = clock.daily_premarket_bucket()
+    news_b = clock.news_bucket()
+    verdict_b = f"{daily_b}|{news_b}"
+
+    # Fan-out parallel pre-warm — all tabs share one cache-warming pass.
+    # On warm cache this returns in <50 ms.
+    _prewarm_parallel(
+        owner=auth.is_owner(),
+        chatter_b=chatter_b, flowgod_b=flowgod_b,
+        pre_b=pre_b, post_b=post_b,
+        holdings_b=holdings_b, daily_b=daily_b,
+        news_b=news_b, verdict_b=verdict_b,
+    )
 
     tab_labels = ["🌅 Pre-Market", "🌇 Post-Market", "🔥 X Chatter",
                   "🌊 FlowGod", "🔍 Analyze"]
